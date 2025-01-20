@@ -15,6 +15,7 @@ import {
 import { Client } from "../lsp/Client";
 import { ContextVariables } from "../ContextVariables";
 import { getLogger } from "../logger";
+import { diffChars } from "diff";
 
 export class InlineEditController {
   private readonly logger = getLogger("InlineEditController");
@@ -23,6 +24,7 @@ export class InlineEditController {
 
   private recentlyCommand: string[] = [];
   private suggestedCommand: ChatEditCommand[] = [];
+  private originalText: string | null = null;
 
   constructor(
     private client: Client,
@@ -74,6 +76,9 @@ export class InlineEditController {
 
   private async provideEditWithCommand(command: string) {
     const startPosition = new Position(this.editLocation.range.start.line, this.editLocation.range.start.character);
+    const endPosition = new Position(this.editLocation.range.end.line, this.editLocation.range.end.character);
+
+    this.originalText = this.editor.document.getText(new Selection(startPosition, endPosition));
 
     if (!this.userCommand) {
       const updatedRecentlyCommand = [command]
@@ -87,7 +92,7 @@ export class InlineEditController {
     this.chatEditCancellationTokenSource = new CancellationTokenSource();
     this.logger.log(`Provide edit with command: ${command}`);
     try {
-      await this.client.chat.provideEdit(
+      const token = await this.client.chat.provideEdit(
         {
           location: this.editLocation,
           command,
@@ -95,6 +100,9 @@ export class InlineEditController {
         },
         this.chatEditCancellationTokenSource.token,
       );
+      if (token) {
+        await this.highlightChanges(token);
+      }
     } catch (error) {
       if (typeof error === "object" && error && "message" in error && typeof error["message"] === "string") {
         window.showErrorMessage(error["message"]);
@@ -105,6 +113,104 @@ export class InlineEditController {
     this.contextVariables.chatEditInProgress = false;
     this.editor.selection = new Selection(startPosition, startPosition);
   }
+
+
+
+  private async highlightChanges(token: string) {
+    const editorContent = this.editor.document.getText();
+    const startMarker = `<<<<<< ${token}`;
+    const endMarker = `>>>>>> ${token}`;
+  
+    this.logger.log(`Original Text:\n${this.originalText}`);
+    this.logger.log(`Editor Content (After Provide Edit):\n${editorContent}`);
+  
+    const startMarkerIndex = editorContent.indexOf(startMarker);
+    const endMarkerIndex = editorContent.indexOf(endMarker);
+
+    this.logger.debug("Start Marker Index:", startMarkerIndex);
+    this.logger.debug("End Marker Index:", endMarkerIndex);
+  
+    if (startMarkerIndex === -1 || endMarkerIndex === -1) {
+      this.logger.error("Unable to find change markers in the document.");
+      return;
+    }
+  
+    // Determinar el rango del texto original y modificado
+    const startOfModifiedText = editorContent.indexOf("\n", startMarkerIndex) + 1;
+    const endOfModifiedText = editorContent.lastIndexOf("\n", endMarkerIndex);
+    this.logger.debug("Start of Modified Text:", startOfModifiedText);
+    this.logger.debug("End of Modified Text:", endOfModifiedText);
+  
+    const modifiedText = editorContent.slice(startOfModifiedText, endOfModifiedText).trim();
+    this.logger.debug("Modified Text:", modifiedText);
+  
+    if (!this.originalText) {
+      this.logger.error("Original text is missing.");
+      return;
+    }
+  
+    // Dividir las líneas de texto
+    const originalTextLines = this.originalText.split("\n");
+    const fullDiffLines = modifiedText.split("\n");
+    this.logger.debug("originalTextLines:", originalTextLines);
+    this.logger.debug("fullDiffLines:", fullDiffLines);
+  
+    this.logger.log(`Number of Original Text Lines: ${originalTextLines.length}`);
+    const modifiedLines = fullDiffLines.slice(originalTextLines.length-1);
+  
+    this.logger.log(`Modified Lines:\n${JSON.stringify(modifiedLines, null, 2)}`);
+  
+    // Determinar el offset de las líneas modificadas en el editor
+    // const modifiedStartLine = originalTextLines.length; // Donde empieza el texto modificado
+    const modifiedTextStartIndex = editorContent.indexOf(modifiedLines.join("\n"), startOfModifiedText);
+  
+    // Usar `diff` para comparar caracteres entre el texto original y el modificado
+    const differences = diffChars(this.originalText, modifiedLines.join("\n"));
+  
+    const decorationRanges: Selection[] = [];
+    let currentModifiedIndex = modifiedTextStartIndex; // Índice absoluto dentro del editor
+    this.logger.debug(`Modified Text Start Index: ${modifiedTextStartIndex}`);
+  
+    this.logger.log(`Diff Results:\n${JSON.stringify(differences, null, 2)}`);
+  
+    for (const part of differences) {
+      if (part.added) {
+        this.logger.log(`Added part detected: "${part.value}"`);
+        for (const char of part.value) {
+          const absoluteIndex = currentModifiedIndex;
+  
+          // Obtener la posición exacta en el editor
+          const start = this.editor.document.positionAt(absoluteIndex);
+          const end = new Position(start.line, start.character + 1);
+  
+          decorationRanges.push(new Selection(start, end));
+          this.logger.log(`Highlighted char: "${char}" at ${start.line}:${start.character}`);
+  
+          currentModifiedIndex++;
+        }
+      } else if (part.removed) {
+        this.logger.log(`Removed part detected (ignored): "${part.value}"`);
+      } else {
+        this.logger.log(`Unchanged part detected: "${part.value}"`);
+        currentModifiedIndex += part.value.length;
+      }
+    }
+  
+    // Aplicar decoraciones a los caracteres modificados
+    const decorationType = window.createTextEditorDecorationType({
+      backgroundColor: "rgba(255, 255, 255, 0.3)"
+    });
+    
+  
+    this.editor.setDecorations(decorationType, decorationRanges);
+  
+    this.logger.log(`Highlighted changes for token: ${token}`);
+  }
+  
+  
+  
+
+
 
   private async onDidTriggerItemButton(event: QuickPickItemButtonEvent<EditCommand>) {
     const item = event.item;
